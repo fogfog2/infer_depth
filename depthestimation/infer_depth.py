@@ -166,9 +166,7 @@ if __name__ =="__main__":
             tensor_image = tensor_image.cuda()
              
         depth = infer.inference(options.parse(),tensor_image)
-        depth = np.clip(255-np.squeeze(depth)*60, 0, 255).astype(np.uint8)
-        #depth = np.uint8(depth)
-        
+        depth = np.clip(255-np.squeeze(depth)*60, 0, 255).astype(np.uint8)        
         color = cv2.applyColorMap(depth, cv2.COLORMAP_JET)
         
         cv2.imshow("input",cv_image)        

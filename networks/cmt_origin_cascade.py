@@ -16,7 +16,7 @@ Date: 2021/07/14
 
 import torch as t
 from torch.nn import functional as F
-from networks.cmt_module import Stem, PatchAggregation, CMTBlock
+from mono_depth.networks.cmt_module import Stem, PatchAggregation, CMTBlock
 
 
 #########################

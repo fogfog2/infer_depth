@@ -2,14 +2,23 @@ import cv2
 import numpy as np
 import torch
 import os
-from depthestimation.options_ucl import DepthOptions
-from depthestimation.layers import transformation_from_parameters, disp_to_depth
-from depthestimation import networks
-from torchvision import transforms
+#from options_ucl import DepthOptions
+from mono_depth.layers import transformation_from_parameters, disp_to_depth
+from mono_depth import networks
+#from torchvision import transforms
 
 class Inference():
     
-    def __init__(self, opt):
+    def __init__(self, opt, model_name="model"):
+
+        file_dir = os.path.dirname(__file__)
+        model_dir = os.path.join(file_dir,model_name)
+        opt.load_weights_folder=model_dir
+        opt.eval_mono = True
+        opt.no_teacher = True
+        opt.png = True
+        #opt.train_model ="cmt"
+
         self.MIN_DEPTH = 1e-3
         self.MAX_DEPTH = 80
 
@@ -84,22 +93,22 @@ class Inference():
         pose_enc_dict = torch.load(os.path.join(opt.load_weights_folder, "pose_encoder.pth"))
         pose_dec_dict = torch.load(os.path.join(opt.load_weights_folder, "pose.pth"))
 
-        pose_enc = networks.ResnetEncoder(18, False, num_input_images=2)
-        pose_dec = networks.PoseDecoder(pose_enc.num_ch_enc, num_input_features=1,
+        self.pose_enc = networks.ResnetEncoder(18, False, num_input_images=2)
+        self.pose_dec = networks.PoseDecoder(self.pose_enc.num_ch_enc, num_input_features=1,
                                         num_frames_to_predict_for=2)
 
-        pose_enc.load_state_dict(pose_enc_dict, strict=True)
-        pose_dec.load_state_dict(pose_dec_dict, strict=True)
+        self.pose_enc.load_state_dict(pose_enc_dict, strict=True)
+        self.pose_dec.load_state_dict(pose_dec_dict, strict=True)
 
         min_depth_bin = encoder_dict.get('min_depth_bin')
         max_depth_bin = encoder_dict.get('max_depth_bin')
 
-        pose_enc.eval()
-        pose_dec.eval()
+        self.pose_enc.eval()
+        self.pose_dec.eval()
         
         if torch.cuda.is_available():
-            pose_enc.cuda(cuda_device)
-            pose_dec.cuda(cuda_device)
+            self.pose_enc.cuda(cuda_device)
+            self.pose_dec.cuda(cuda_device)
         
         self.encoder = encoder_class(**encoder_opts)     
         
@@ -126,50 +135,58 @@ class Inference():
             output = self.encoder(input_color)
             output = self.depth_decoder(output)    
             
-            pred_depth, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
-            pred_depth = pred_depth.cpu()[:, 0].numpy()
-        
-        
-        return pred_depth
-    
-if __name__ =="__main__":
-    options = DepthOptions()
-    infer = Inference(options.parse())            
-    to_tensor = transforms.ToTensor()
- 
-    INPUT_MODE = ["VIDEO","IMAGE"]
-    
-    Mode = INPUT_MODE[1]
-    
-    if Mode==INPUT_MODE[0]:
-        cap = cv2.VideoCapture(0)
-    else:
-        img_dir = "/home/sj/test_colon"
-        filenames = sorted(os.listdir(img_dir))
-    
-    count = 0
-    
-    while True:                
-        if Mode==INPUT_MODE[0]:
-            ret, cv_image = cap.read()
-        else:            
+            pred_disp, pred_depth= disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
+#            pred_depth = pred_depth.cpu()[:, 0].numpy()
+        return pred_disp, pred_depth
+
+    def pose_inference(self, opt,  input_prev, input_current):       
             
-            if len(filenames)<=count:
-                count = 0
-            img_path = os.path.join(img_dir,filenames[count])            
-            cv_image = cv2.imread(img_path)
-            count=count+1            
+        with torch.no_grad():            
+            pose_inputs = [input_prev, input_current]
+            output = [self.pose_enc(torch.cat(pose_inputs,1))]
+            axisangle, translation = self.pose_dec(output)    
+            pose = transformation_from_parameters(axisangle[:, 0], translation[:, 0], invert=True)
+            
+        return pose
+
+# if __name__ =="__main__":
+#     options = DepthOptions()
+#     infer = Inference(options.parse())            
+#     to_tensor = transforms.ToTensor()
+ 
+#     INPUT_MODE = ["VIDEO","IMAGE"]
+    
+#     Mode = INPUT_MODE[0]
+    
+#     if Mode==INPUT_MODE[0]:
+#         cap = cv2.VideoCapture(0)
+#     else:
+#         img_dir = "/home/sj/test_colon"
+#         filenames = sorted(os.listdir(img_dir))
+    
+#     count = 0
+    
+#     while True:                
+#         if Mode==INPUT_MODE[0]:
+#             ret, cv_image = cap.read()
+#         else:            
+            
+#             if len(filenames)<=count:
+#                 count = 0
+#             img_path = os.path.join(img_dir,filenames[count])            
+#             cv_image = cv2.imread(img_path)
+#             count=count+1            
                     
-        tensor_image =  to_tensor(cv_image).unsqueeze(0)        
+#         tensor_image =  to_tensor(cv_image).unsqueeze(0)        
         
-        if torch.cuda.is_available():
-            tensor_image = tensor_image.cuda()
+#         if torch.cuda.is_available():
+#             tensor_image = tensor_image.cuda()
              
-        depth = infer.inference(options.parse(),tensor_image)
-        depth = np.clip(255-np.squeeze(depth)*60, 0, 255).astype(np.uint8)        
-        color = cv2.applyColorMap(depth, cv2.COLORMAP_JET)
+#         depth = infer.inference(options.parse(),tensor_image)
+#         depth = np.clip(255-np.squeeze(depth)*60, 0, 255).astype(np.uint8)        
+#         color = cv2.applyColorMap(depth, cv2.COLORMAP_JET)
         
-        cv2.imshow("input",cv_image)        
-        cv2.imshow("output",color)
-        cv2.waitKey(33)
+#         cv2.imshow("input",cv_image)        
+#         cv2.imshow("output",color)
+#         cv2.waitKey(33)
         

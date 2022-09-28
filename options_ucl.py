@@ -7,7 +7,7 @@
 import os
 import argparse
 
-file_dir = os.path.dirname(__file__)  # the directory that options.py resides in
+#file_dir = os.path.dirname(__file__)  # the directory that options.py resides in
 
 
 class DepthOptions:
@@ -17,8 +17,8 @@ class DepthOptions:
         # PATHS
         self.parser.add_argument("--data_path",
                                  type=str,
-                                 help="path to the training data",
-                                 default=os.path.join(file_dir, "kitti_data"))
+                                 help="path to the training data")
+                                # default=os.path.join(file_dir, "kitti_data"))
         self.parser.add_argument("--log_dir",
                                  type=str,
                                  help="log directory",
@@ -327,6 +327,6 @@ class DepthOptions:
                                  action='store_true',
                                  help='If set, the teacher network will be evaluated')
 
-    def parse(self):
-        self.options = self.parser.parse_args()
+    def parse(self):        
+        self.options, unknown = self.parser.parse_known_args()
         return self.options

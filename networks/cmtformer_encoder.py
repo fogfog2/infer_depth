@@ -16,8 +16,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import torch.utils.model_zoo as model_zoo
-from layers import BackprojectDepth, Project3D
+from mono_depth.layers import BackprojectDepth, Project3D
 
+from mono_depth.networks.cmt_origin_cascade import CMT_Layer, CMT_Feature, CMT_Ti, CMT_XS, CMT_XS2, CMT_B
 
 class ResNetMultiImageInput(models.ResNet):
     """Constructs a resnet model with varying number of input images.
@@ -65,7 +66,20 @@ def resnet_multiimage_input(num_layers, pretrained=False, num_input_images=1):
     return model
 
 
-class ResnetEncoderMatching(nn.Module):
+class fcconv(nn.Module):
+    def __init__(self,  in_channel, out_channel):
+        super().__init__()
+        self.conv =  nn.Conv2d(in_channel, out_channel, kernel_size=1)
+        self.nonlin = nn.ELU(inplace=True)
+        self.bn1 = nn.BatchNorm2d(out_channel)
+
+    def forward(self, x):
+        out = self.conv(x)
+        out = self.nonlin(self.bn1(out))
+        ##norm?
+        return out
+
+class CMTEncoderMatching(nn.Module):
     """Resnet encoder adapted to include a cost volume after the 2nd block.
 
     Setting adaptive_bins=True will recompute the depth bins used for matching upon each
@@ -74,15 +88,15 @@ class ResnetEncoderMatching(nn.Module):
 
     def __init__(self, num_layers, pretrained, input_height, input_width,
                  min_depth_bin=0.1, max_depth_bin=20.0, num_depth_bins=96,
-                 adaptive_bins=False, depth_binning='linear'):
+                 adaptive_bins=False, depth_binning='linear', upconv=True, start_layer=2, embed_dim = 46, use_cmt_feature =False):
 
-        super(ResnetEncoderMatching, self).__init__()
+        super(CMTEncoderMatching, self).__init__()
 
         self.adaptive_bins = adaptive_bins
         self.depth_binning = depth_binning
         self.set_missing_to_max = True
 
-        self.num_ch_enc = np.array([64, 64, 128, 256, 512])
+        
         self.num_depth_bins = num_depth_bins
         # we build the cost volume at 1/4 resolution
         self.matching_height, self.matching_width = input_height // 4, input_width // 4
@@ -90,7 +104,10 @@ class ResnetEncoderMatching(nn.Module):
         self.is_cuda = False
         self.warp_depths = None
         self.depth_bins = None
-
+        
+        self.use_upconv = upconv
+        self.cmt_start_layer = start_layer
+        self.use_cmt_feature = use_cmt_feature
         resnets = {18: models.resnet18,
                    34: models.resnet34,
                    50: models.resnet50,
@@ -103,13 +120,65 @@ class ResnetEncoderMatching(nn.Module):
         encoder = resnets[num_layers](pretrained)
         self.layer0 = nn.Sequential(encoder.conv1,  encoder.bn1, encoder.relu)
         self.layer1 = nn.Sequential(encoder.maxpool,  encoder.layer1)
-        self.layer2 = encoder.layer2
-        self.layer3 = encoder.layer3
-        self.layer4 = encoder.layer4
 
+
+        if self.cmt_start_layer>2:
+            self.layer2 = encoder.layer2
+        
+        if self.cmt_start_layer>3:
+            self.layer3 = encoder.layer3
+            self.layer4 = encoder.layer4
+        
+
+        self.stem_channel = 64
+        self.embed_dim= embed_dim    
+        
+        
+        repeats= [2,2,2,2]
+        if self.use_cmt_feature:
+            self.cmt_feature = CMT_Feature(input_width = input_width, input_height= input_height, embed_dim= self.embed_dim, start_layer=self.cmt_start_layer, use_upconv =self.use_upconv,repeats=repeats)        
+        
+        
+        self.cmt = CMT_Layer(input_width = input_width, input_height= input_height, embed_dim= self.embed_dim, start_layer=self.cmt_start_layer, use_upconv =self.use_upconv or self.use_cmt_feature, repeats=repeats)
+
+        # self.stem_channel = 64
+        # self.embed_dim= 52    
+        # self.cmt = CMT_XS(in_channels = 3, input_size = 256, embed_dim= self.embed_dim)
+
+        # self.stem_channel = 64
+        # self.embed_dim= 52    
+        # self.cmt = CMT_XS2(in_channels = 3, input_size = 256, embed_dim= self.embed_dim)
+
+        # self.stem_channel = 64
+        # self.embed_dim= 76    
+        # self.cmt = CMT_B(in_channels = 3, input_size = 256, embed_dim= self.embed_dim)
+    
+        
+        #cmt_feature
+        self.num_ch_enc = np.array([64, 64, 128, 256, 512])
         if num_layers > 34:
-            self.num_ch_enc[1:] *= 4
+           self.num_ch_enc[1:] *= 4
 
+        # if num_layers > 34:
+        #     self.num_ch_enc = np.array([46, 256, self.embed_dim*2, self.embed_dim*4, self.embed_dim*8])
+            
+        # else:         
+        #     #self.num_ch_enc = np.array([64, 64, self.embed_dim*2, self.embed_dim*4, self.embed_dim*8])
+        #     self.num_ch_enc = np.array([64, 64, self.embed_dim*2, self.embed_dim*4, self.embed_dim*8])        
+        
+        for i in range(start_layer,5):
+            value = 2**(i-1)
+            self.num_ch_enc[i] = self.embed_dim * value
+            
+        
+        if use_cmt_feature:            
+            self.num_ch_enc = np.array([64, self.embed_dim, self.embed_dim*2, self.embed_dim*4, self.embed_dim*8])
+        self.res_ch_enc = np.array([64, 64, 128, 256, 512])
+
+        self.upconv = fcconv(self.res_ch_enc[1],self.embed_dim)
+        self.upconv2 = fcconv(self.res_ch_enc[2],self.embed_dim*2)
+        self.upconv3 = fcconv(self.res_ch_enc[3],self.embed_dim*4)
+        
         self.backprojector = BackprojectDepth(batch_size=self.num_depth_bins,
                                               height=self.matching_height,
                                               width=self.matching_width)
@@ -124,11 +193,22 @@ class ResnetEncoderMatching(nn.Module):
                                               nn.ReLU(inplace=True)
                                               )
 
-        self.reduce_conv = nn.Sequential(nn.Conv2d(self.num_ch_enc[1] + self.num_depth_bins,
+        
+
+        if self.use_cmt_feature:
+            self.reduce_conv_cmt_feature= nn.Sequential(nn.Conv2d(embed_dim + self.num_depth_bins,
+                                                    out_channels=embed_dim,
+                                                    kernel_size=3, stride=1, padding=1),
+                                         nn.ReLU(inplace=True)
+                                         )  
+        else:
+            self.reduce_conv = nn.Sequential(nn.Conv2d(self.num_ch_enc[1] + self.num_depth_bins,
                                                    out_channels=self.num_ch_enc[1],
                                                    kernel_size=3, stride=1, padding=1),
                                          nn.ReLU(inplace=True)
                                          )
+                                            
+                                        
 
     def compute_depth_bins(self, min_depth_bin, max_depth_bin):
         """Compute the depths bins used to build the cost volume. Bins will depend upon
@@ -152,13 +232,18 @@ class ResnetEncoderMatching(nn.Module):
             self.warp_depths.append(depth)
         self.warp_depths = torch.stack(self.warp_depths, 0).float()
         if self.is_cuda:
-            self.warp_depths = self.warp_depths.cuda()
+            self.warp_depths = self.warp_depths.cuda(self.device)
 
     def match_features(self, current_feats, lookup_feats, relative_poses, K, invK):
         """Compute a cost volume based on L1 difference between current_feats and lookup_feats.
 
         We backwards warp the lookup_feats into the current frame using the estimated relative
-        pose, known intrinsics and using hypothesised depths self.warp_depths (which are either
+        pose, known intrinsics and using hypothesised d    
+        
+        #cmt_feature
+        self.num_ch_enc = np.array([64, 64, 128, 256, 512])
+        if num_layers > 34:
+           self.num_ch_enc[1:] *= 4epths self.warp_depths (which are either
         linear in depth or linear in inverse depth).
 
         If relative_pose == 0 then this indicates that the lookup frame is missing (i.e. we are
@@ -241,6 +326,22 @@ class ResnetEncoderMatching(nn.Module):
         image = (image - 0.45) / 0.225  # imagenet normalisation
         feats_0 = self.layer0(image)
         feats_1 = self.layer1(feats_0)
+        if return_all_feats:
+            return [feats_0, feats_1]
+        else:
+            return feats_1
+        
+        
+    def cmt_feature_extraction(self, image, return_all_feats=False):
+        """ Run feature extraction on an image - first 2 blocks of ResNet"""
+
+        image = (image - 0.45) / 0.225  # imagenet normalisation
+        #feats_0 = self.layer0(imagswin_featuree)
+        #feats_1 = self.layer1(feats_0)
+        
+        features =self.cmt_feature(image)
+        feats_0 = features[0]
+        feats_1 = features[1]
 
         if return_all_feats:
             return [feats_0, feats_1]
@@ -269,7 +370,10 @@ class ResnetEncoderMatching(nn.Module):
                 ):
 
         # feature extraction
-        self.features = self.feature_extraction(current_image, return_all_feats=True)
+        if not self.use_cmt_feature:
+            self.features = self.feature_extraction(current_image, return_all_feats=True)
+        else:
+            self.features = self.cmt_feature_extraction(current_image, return_all_feats=True)
         current_feats = self.features[-1]
 
         # feature extraction on lookup images - disable gradients to save memorylayer2
@@ -279,8 +383,13 @@ class ResnetEncoderMatching(nn.Module):
 
             batch_size, num_frames, chns, height, width = lookup_images.shape
             lookup_images = lookup_images.reshape(batch_size * num_frames, chns, height, width)
-            lookup_feats = self.feature_extraction(lookup_images,
-                                                   return_all_feats=False)
+            
+            if not self.use_cmt_feature:
+                lookup_feats = self.feature_extraction(lookup_images,
+                                                    return_all_feats=False)
+            else:
+                lookup_feats = self.cmt_feature_extraction(lookup_images,
+                                                    return_all_feats=False)
             _, chns, height, width = lookup_feats.shape
             lookup_feats = lookup_feats.reshape(batch_size, num_frames, chns, height, width)
 
@@ -298,11 +407,43 @@ class ResnetEncoderMatching(nn.Module):
 
         # mask the cost volume based on the confidence
         cost_volume *= confidence_mask.unsqueeze(1)
-        post_matching_feats = self.reduce_conv(torch.cat([self.features[-1], cost_volume], 1))
+        
+        if not self.use_cmt_feature:
+            post_matching_feats = self.reduce_conv(torch.cat([self.features[-1], cost_volume], 1))
+        else:
+            post_matching_feats = self.reduce_conv_cmt_feature(torch.cat([self.features[-1], cost_volume], 1))
 
-        self.features.append(self.layer2(post_matching_feats))
-        self.features.append(self.layer3(self.features[-1]))
-        self.features.append(self.layer4(self.features[-1]))
+        if self.use_upconv:
+            out = self.upconv(post_matching_feats)
+        else:
+            out = post_matching_feats
+        
+        if self.cmt_start_layer>2:
+            post_matching_feats = self.layer2(post_matching_feats)                     
+            self.features.append(post_matching_feats)
+            if self.use_upconv:
+                out = self.upconv2(post_matching_feats)
+            else:
+                out = post_matching_feats       
+                
+            if self.cmt_start_layer>3:             
+                post_matching_feats = self.layer3(post_matching_feats)
+                self.features.append(post_matching_feats)
+                if self.use_upconv:
+                    out = self.upconv3(post_matching_feats)
+                else:
+                    out = post_matching_feats     
+
+
+        #self.features.append(self.layer2(post_matching_feats))
+        
+ 
+        out = self.cmt(out)
+        self.features = self.features + out
+
+        # 
+        # self.features.append(self.layer3(self.features[-1]))
+        # self.features.append(self.layer4(self.features[-1]))
 
         return self.features, lowest_cost, confidence_mask
 
@@ -315,7 +456,6 @@ class ResnetEncoderMatching(nn.Module):
         if self.warp_depths is not None:
             self.warp_depths = self.warp_depths.cuda(device)
             
-
     def cpu(self):
         super().cpu()
         self.backprojector.cpu()
@@ -335,14 +475,14 @@ class ResnetEncoderMatching(nn.Module):
             raise NotImplementedError
 
 
-class ResnetEncoder(nn.Module):
+class ResnetEncoderCMT(nn.Module):
     """Pytorch module for a resnet encoder
     """
 
-    def __init__(self, num_layers, pretrained, num_input_images=1, **kwargs):
-        super(ResnetEncoder, self).__init__()
+    def __init__(self, num_layers, pretrained, num_input_images=1, input_height=192, input_width=640, upconv=True, start_layer=2, embed_dim = 46, use_cmt_feature =False, **kwargs):
+        super(ResnetEncoderCMT, self).__init__()
 
-        self.num_ch_enc = np.array([64, 64, 128, 256, 512])
+#        self.num_ch_enc = np.array([64, 64, 128, 256, 512])
 
         resnets = {18: models.resnet18,
                    34: models.resnet34,
@@ -357,19 +497,82 @@ class ResnetEncoder(nn.Module):
             self.encoder = resnet_multiimage_input(num_layers, pretrained, num_input_images)
         else:
             self.encoder = resnets[num_layers](pretrained)
+        
+        self.stem_channel = 64
+        self.embed_dim= 46    
+        #self.cmt = CMT_Ti(in_channels = 3, input_width = 640, input_height = 192, embed_dim= self.embed_dim)
+        self.use_upconv = upconv
+        self.cmt_start_layer = start_layer
 
+        self.cmt = CMT_Layer(input_width = input_width, input_height= input_height, embed_dim= self.embed_dim, start_layer=start_layer, use_upconv =upconv or use_cmt_feature, num_layer = num_layers)
+
+
+        self.layer0 = nn.Sequential(self.encoder.conv1,  self.encoder.bn1, self.encoder.relu)
+        self.layer1 = nn.Sequential(self.encoder.maxpool,  self.encoder.layer1)
+        if self.cmt_start_layer>2:    
+            self.layer2 = self.encoder.layer2
+        if self.cmt_start_layer>3:                
+            self.layer3 = self.encoder.layer3
+
+        self.res_ch_enc = np.array([64, 64, 128, 256, 512])
+        self.upconv = fcconv(self.res_ch_enc[1],self.embed_dim)
+
+        if self.cmt_start_layer>2:    
+            self.upconv2 = fcconv(self.res_ch_enc[2],self.embed_dim*2)
+        if self.cmt_start_layer>3:    
+            self.upconv3 = fcconv(self.res_ch_enc[3],self.embed_dim*4)
+
+        # if num_layers > 34:
+        #     self.num_ch_enc = np.array([64, 256, self.embed_dim*2, self.embed_dim*4, self.embed_dim*8])
+            
+        # else:         
+        #     self.num_ch_enc = np.array([64, 64, self.embed_dim*2, self.embed_dim*4, self.embed_dim*8])
+
+        self.num_ch_enc = np.array([64, 64, 128, 256, 512])
         if num_layers > 34:
             self.num_ch_enc[1:] *= 4
+
+        for i in range(start_layer,5):
+            value = 2**(i-1)
+            self.num_ch_enc[i] = self.embed_dim * value
+
+        #if num_layers > 34:
+        #    self.num_ch_enc[1:] *= 4
 
     def forward(self, input_image):
         self.features = []
         x = (input_image - 0.45) / 0.225
         x = self.encoder.conv1(x)
-        x = self.encoder.bn1(x)
+        x = self.encoder.bn1(x)        
         self.features.append(self.encoder.relu(x))
         self.features.append(self.encoder.layer1(self.encoder.maxpool(self.features[-1])))
-        self.features.append(self.encoder.layer2(self.features[-1]))
-        self.features.append(self.encoder.layer3(self.features[-1]))
-        self.features.append(self.encoder.layer4(self.features[-1]))
+
+        if self.use_upconv:
+            out = self.upconv(self.features[-1])
+        else:
+            out = self.features[-1]
+            
+        if self.cmt_start_layer>2:                
+            post_matching_feats = self.layer2(self.features[-1])                     
+            self.features.append(post_matching_feats)
+            if self.use_upconv:
+                out = self.upconv2(post_matching_feats)
+            else:
+                out = post_matching_feats       
+                
+            if self.cmt_start_layer>3:             
+                post_matching_feats = self.layer3(post_matching_feats)
+                self.features.append(post_matching_feats)
+                if self.use_upconv:
+                    out = self.upconv3(post_matching_feats)
+                else:
+                    out = post_matching_feats     
+
+        out = self.cmt(out)
+        self.features = self.features + out
+
+        # self.features.append(self.encoder.layer2(self.features[-1]))
+        # self.features.append(self.encoder.layer3(self.features[-1]))
+        # self.features.append(self.encoder.layer4(self.features[-1]))
 
         return self.features
